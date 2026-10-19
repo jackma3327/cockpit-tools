@@ -42,8 +42,8 @@ if (syncResult.status !== 0) {
 }
 
 const tauriResult = spawnSync(
-  'tauri',
-  ['dev', '--config', 'src-tauri/tauri.dev.conf.json', ...extraArgs],
+  process.platform === 'win32' ? 'npx.cmd' : 'npx',
+  ['tauri', 'dev', '--config', 'src-tauri/tauri.dev.conf.json', ...extraArgs],
   {
     stdio: 'inherit',
     env,
