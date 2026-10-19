@@ -637,3 +637,205 @@ use super::*;
             Some("public-key")
         );
     }
+
+    // ─── JSON 导入平台归属回归测试 ───
+    // 背景：第三方 Trae CN 导出 JSON（无平台标记、带 trae.cn Cookie）从 Trae CN 页面导入后，
+    // 账号曾错误落在国际站 Trae 页面。以下用例锁定「显式标记 > Cookie 提示 > 页面上下文 > 默认 Trae」优先级。
+
+    fn third_party_cn_import_item() -> Value {
+        serde_json::json!({
+            "name": "账号21",
+            "token": "header.payload.signature",
+            "refreshToken": "otsccU534xZHD9iGpF4ZSEZsh3kU26lFOOJjgzjno4Q=.18dfc7851041e09f",
+            "deviceId": "",
+            "machineId": "",
+            "enabled": true,
+            "cookies": [
+                {
+                    "name": "sessionid",
+                    "value": "8787b04c83b8788186dd6bcf229eef1a",
+                    "host_key": ".trae.cn",
+                    "path": "/",
+                    "expires_utc": 13441944465266504_u64,
+                    "is_secure": false,
+                    "is_httponly": true
+                },
+                {
+                    "name": "gfkadpd",
+                    "value": "711126,40124",
+                    "host_key": "www.trae.cn",
+                    "path": "/",
+                    "expires_utc": 13437019447000000_u64,
+                    "is_secure": true,
+                    "is_httponly": false
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn json_import_with_cn_cookies_and_page_context_lands_on_trae_cn() {
+        let payload = payload_from_import_value(third_party_cn_import_item(), Some(TraePlatformKind::TraeCn))
+            .expect("payload");
+
+        assert_eq!(
+            resolve_payload_platform_kind(&payload),
+            TraePlatformKind::TraeCn
+        );
+        let auth = payload.trae_auth_raw.expect("stamped auth raw");
+        assert_eq!(
+            auth.get("platformId").and_then(Value::as_str),
+            Some("trae_cn")
+        );
+        assert_eq!(
+            auth.get("platformName").and_then(Value::as_str),
+            Some("Trae CN")
+        );
+        assert_eq!(
+            auth.get("authDomain").and_then(Value::as_str),
+            Some("www.trae.cn")
+        );
+    }
+
+    #[test]
+    fn json_import_cookie_host_hint_beats_mismatched_page_context() {
+        // 数据自带 trae.cn Cookie（CN 账号事实），即使从国际站页面导入也应落在 Trae CN。
+        let payload = payload_from_import_value(third_party_cn_import_item(), Some(TraePlatformKind::Trae))
+            .expect("payload");
+
+        assert_eq!(
+            resolve_payload_platform_kind(&payload),
+            TraePlatformKind::TraeCn
+        );
+    }
+
+    #[test]
+    fn json_import_explicit_platform_marker_beats_cookie_and_page_context() {
+        let mut item = third_party_cn_import_item();
+        item.as_object_mut().expect("object").insert(
+            "trae_auth_raw".to_string(),
+            serde_json::json!({
+                "platformId": "trae",
+                "authDomain": "www.trae.ai"
+            }),
+        );
+
+        let payload =
+            payload_from_import_value(item, Some(TraePlatformKind::TraeCn)).expect("payload");
+
+        assert_eq!(
+            resolve_payload_platform_kind(&payload),
+            TraePlatformKind::Trae
+        );
+    }
+
+    #[test]
+    fn json_import_without_hints_follows_page_context() {
+        let payload = payload_from_import_value(
+            serde_json::json!({
+                "name": "账号22",
+                "token": "header.payload.signature",
+                "refreshToken": "refresh-22"
+            }),
+            Some(TraePlatformKind::TraeSoloCn),
+        )
+        .expect("payload");
+
+        assert_eq!(
+            resolve_payload_platform_kind(&payload),
+            TraePlatformKind::TraeSoloCn
+        );
+        let auth = payload.trae_auth_raw.expect("stamped auth raw");
+        assert_eq!(
+            auth.get("platformId").and_then(Value::as_str),
+            Some("trae_solo_cn")
+        );
+    }
+
+    #[test]
+    fn json_import_without_any_platform_signal_defaults_to_global_trae() {
+        let payload = payload_from_import_value(
+            serde_json::json!({
+                "name": "账号23",
+                "token": "header.payload.signature"
+            }),
+            None,
+        )
+        .expect("payload");
+
+        assert_eq!(
+            resolve_payload_platform_kind(&payload),
+            TraePlatformKind::Trae
+        );
+        assert!(payload.trae_auth_raw.is_none());
+    }
+
+    #[test]
+    fn detect_platform_from_cookie_hosts_supports_alternate_key_names() {
+        assert_eq!(
+            detect_platform_from_cookie_hosts(&serde_json::json!({
+                "cookies": [{ "hostKey": "www.trae.cn" }]
+            })),
+            Some(TraePlatformKind::TraeCn)
+        );
+        assert_eq!(
+            detect_platform_from_cookie_hosts(&serde_json::json!({
+                "cookies": [{ "domain": ".trae.com.cn" }]
+            })),
+            Some(TraePlatformKind::TraeCn)
+        );
+        assert_eq!(
+            detect_platform_from_cookie_hosts(&serde_json::json!({
+                "cookies": [{ "host_key": ".trae.ai" }]
+            })),
+            None
+        );
+        assert_eq!(
+            detect_platform_from_cookie_hosts(&serde_json::json!({ "cookies": [] })),
+            None
+        );
+        assert_eq!(
+            detect_platform_from_cookie_hosts(&serde_json::json!({ "cookies": [{ "host_key": 42 }] })),
+            None
+        );
+    }
+
+    #[test]
+    fn stamp_import_platform_on_account_preserves_existing_markers() {
+        let mut account = sample_account();
+        account.trae_auth_raw = Some(serde_json::json!({
+            "platformId": "trae",
+            "authDomain": "www.trae.ai"
+        }));
+
+        stamp_import_platform_on_account(&mut account, TraePlatformKind::TraeCn);
+
+        let auth = account.trae_auth_raw.expect("auth raw");
+        assert_eq!(
+            auth.get("platformId").and_then(Value::as_str),
+            Some("trae")
+        );
+        assert!(auth.get("platformName").is_none());
+    }
+
+    #[test]
+    fn stamp_import_platform_on_account_fills_missing_markers() {
+        let mut account = sample_account();
+        account.trae_auth_raw = Some(serde_json::json!({ "accessToken": "token" }));
+
+        stamp_import_platform_on_account(&mut account, TraePlatformKind::TraeCn);
+
+        let auth = account.trae_auth_raw.expect("auth raw");
+        assert_eq!(
+            auth.get("platformId").and_then(Value::as_str),
+            Some("trae_cn")
+        );
+        assert_eq!(
+            auth.get("authDomain").and_then(Value::as_str),
+            Some("www.trae.cn")
+        );
+        assert_eq!(
+            auth.get("accessToken").and_then(Value::as_str),
+            Some("token")
+        );
+    }

@@ -27,8 +27,15 @@ pub fn delete_trae_accounts(account_ids: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn import_trae_from_json(json_content: String) -> Result<Vec<TraeAccount>, String> {
-    trae_account::import_from_json(&json_content)
+pub fn import_trae_from_json(
+    json_content: String,
+    platform_id: Option<String>,
+) -> Result<Vec<TraeAccount>, String> {
+    let platform = match platform_id.as_deref() {
+        Some(raw) => Some(trae_account::TraePlatformKind::parse(Some(raw))?),
+        None => None,
+    };
+    trae_account::import_from_json(&json_content, platform)
 }
 
 #[tauri::command]

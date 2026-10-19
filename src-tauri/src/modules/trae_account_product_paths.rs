@@ -733,7 +733,10 @@ fn attach_platform_metadata_to_payload(
     payload.trae_server_raw = Some(Value::Object(server_obj));
 }
 
-fn resolve_platform_from_roots(roots: &[Option<&Value>]) -> TraePlatformKind {
+/// 检测 raw 数据中的显式平台标记（platformId / authClientId / authDomain / providerCode 等）。
+/// 与 [`resolve_platform_from_roots`] 的区别：没有任何标记时返回 None 而非默认回退 Trae，
+/// 便于导入链路区分「数据自带平台」与「缺失平台信息」两种情况。
+fn detect_explicit_platform_from_roots(roots: &[Option<&Value>]) -> Option<TraePlatformKind> {
     if let Some(platform_id) = pick_string_multi(
         roots,
         &[
@@ -745,7 +748,7 @@ fn resolve_platform_from_roots(roots: &[Option<&Value>]) -> TraePlatformKind {
         ],
     ) {
         if let Ok(platform) = TraePlatformKind::parse(Some(platform_id.as_str())) {
-            return platform;
+            return Some(platform);
         }
     }
 
@@ -795,10 +798,14 @@ fn resolve_platform_from_roots(roots: &[Option<&Value>]) -> TraePlatformKind {
         || provider_hint.ends_with("_cn");
 
     match (is_solo, is_cn) {
-        (true, true) => TraePlatformKind::TraeSoloCn,
-        (true, false) => TraePlatformKind::TraeSolo,
-        (false, true) => TraePlatformKind::TraeCn,
-        (false, false) => TraePlatformKind::Trae,
+        (true, true) => Some(TraePlatformKind::TraeSoloCn),
+        (true, false) => Some(TraePlatformKind::TraeSolo),
+        (false, true) => Some(TraePlatformKind::TraeCn),
+        (false, false) => None,
     }
+}
+
+fn resolve_platform_from_roots(roots: &[Option<&Value>]) -> TraePlatformKind {
+    detect_explicit_platform_from_roots(roots).unwrap_or(TraePlatformKind::Trae)
 }
 

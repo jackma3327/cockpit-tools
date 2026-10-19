@@ -269,13 +269,94 @@ fn payload_from_storage_root(storage_root: &Value) -> Result<TraeImportPayload, 
     })
 }
 
-fn payload_from_import_value(raw: Value) -> Result<TraeImportPayload, String> {
+/// 从导入项的 cookies 中识别 CN 平台（第三方导出 JSON 常带 trae.cn 域名 Cookie）。
+fn detect_platform_from_cookie_hosts(raw: &Value) -> Option<TraePlatformKind> {
+    let cookies = raw.get("cookies")?.as_array()?;
+    let mut is_cn = false;
+    for cookie in cookies {
+        let Some(host) = cookie
+            .get("host_key")
+            .or_else(|| cookie.get("hostKey"))
+            .or_else(|| cookie.get("domain"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let host = host.to_ascii_lowercase();
+        if host.contains("trae.cn") || host.contains("trae.com.cn") {
+            is_cn = true;
+        }
+    }
+    if is_cn {
+        Some(TraePlatformKind::TraeCn)
+    } else {
+        None
+    }
+}
+
+/// 解析导入账号的最终平台归属，优先级：
+/// 1. JSON 数据内的显式平台标记（platformId / authDomain 等，数据自带的事实）；
+/// 2. cookies 中的 trae.cn 域名提示；
+/// 3. 导入入口（页面）携带的平台上下文；
+/// 4. 都无法确定时返回 None，由后续 upsert 默认落到国际站 Trae。
+fn resolve_import_platform(
+    payload: &TraeImportPayload,
+    raw: &Value,
+    import_platform: Option<TraePlatformKind>,
+) -> Option<TraePlatformKind> {
+    let profile_root = profile_payload_root(payload.trae_profile_raw.as_ref());
+    let roots = [
+        payload.trae_auth_raw.as_ref(),
+        profile_root,
+        payload.trae_server_raw.as_ref(),
+        payload.trae_entitlement_raw.as_ref(),
+        payload.trae_usage_raw.as_ref(),
+    ];
+    if let Some(platform) = detect_explicit_platform_from_roots(&roots) {
+        return Some(platform);
+    }
+    if let Some(platform) = detect_platform_from_cookie_hosts(raw) {
+        return Some(platform);
+    }
+    import_platform
+}
+
+/// 将平台归属写入 payload 的 auth_raw（与 OAuth 导入保持同样的字段格式），
+/// 使后端 upsert 的平台分域身份与前端账号页归类都能识别。
+fn stamp_import_platform_on_payload(payload: &mut TraeImportPayload, platform: TraePlatformKind) {
+    let mut auth = match payload.trae_auth_raw.take() {
+        Some(Value::Object(obj)) => obj,
+        _ => Map::new(),
+    };
+    auth.insert(
+        "platformId".to_string(),
+        Value::String(platform.provider_key().to_string()),
+    );
+    auth.insert(
+        "platformName".to_string(),
+        Value::String(platform.display_name().to_string()),
+    );
+    auth.insert(
+        "authDomain".to_string(),
+        Value::String(platform.auth_domain().to_string()),
+    );
+    payload.trae_auth_raw = Some(Value::Object(auth));
+}
+
+fn payload_from_import_value(
+    raw: Value,
+    import_platform: Option<TraePlatformKind>,
+) -> Result<TraeImportPayload, String> {
     let obj = raw
         .as_object()
         .ok_or_else(|| "Trae 导入项必须是对象".to_string())?;
 
     if obj.contains_key(TRAE_STORAGE_AUTH_KEY) || has_trae_auth_storage_key(obj) {
-        return payload_from_storage_root(&raw);
+        let mut payload = payload_from_storage_root(&raw)?;
+        if let Some(platform) = resolve_import_platform(&payload, &raw, import_platform) {
+            stamp_import_platform_on_payload(&mut payload, platform);
+        }
+        return Ok(payload);
     }
 
     let auth_raw = obj
@@ -475,7 +556,7 @@ fn payload_from_import_value(raw: Value) -> Result<TraeImportPayload, String> {
     let status_reason = pick_string(Some(&raw), &[&["status_reason"], &["statusReason"]])
         .or_else(|| pick_string(auth_raw.as_ref(), &[&["statusReason"], &["message"]]));
 
-    Ok(TraeImportPayload {
+    let mut payload = TraeImportPayload {
         email,
         user_id,
         nickname,
@@ -493,10 +574,17 @@ fn payload_from_import_value(raw: Value) -> Result<TraeImportPayload, String> {
         trae_usertag_raw: usertag_raw,
         status,
         status_reason,
-    })
+    };
+    if let Some(platform) = resolve_import_platform(&payload, &raw, import_platform) {
+        stamp_import_platform_on_payload(&mut payload, platform);
+    }
+    Ok(payload)
 }
 
-fn payloads_from_import_json_value(raw: Value) -> Result<Vec<TraeImportPayload>, String> {
+fn payloads_from_import_json_value(
+    raw: Value,
+    import_platform: Option<TraePlatformKind>,
+) -> Result<Vec<TraeImportPayload>, String> {
     match raw {
         Value::Array(items) => {
             if items.is_empty() {
@@ -504,7 +592,7 @@ fn payloads_from_import_json_value(raw: Value) -> Result<Vec<TraeImportPayload>,
             }
             let mut payloads = Vec::with_capacity(items.len());
             for (idx, item) in items.into_iter().enumerate() {
-                let payload = payload_from_import_value(item)
+                let payload = payload_from_import_value(item, import_platform)
                     .map_err(|e| format!("第 {} 条 Trae 账号解析失败: {}", idx + 1, e))?;
                 payloads.push(payload);
             }
@@ -518,28 +606,74 @@ fn payloads_from_import_json_value(raw: Value) -> Result<Vec<TraeImportPayload>,
                     }
                     let mut payloads = Vec::with_capacity(accounts.len());
                     for (idx, item) in accounts.iter().enumerate() {
-                        let payload = payload_from_import_value(item.clone())
+                        let payload = payload_from_import_value(item.clone(), import_platform)
                             .map_err(|e| format!("第 {} 条 Trae 账号解析失败: {}", idx + 1, e))?;
                         payloads.push(payload);
                     }
                     return Ok(payloads);
                 }
             }
-            Ok(vec![payload_from_import_value(Value::Object(obj))?])
+            Ok(vec![payload_from_import_value(
+                Value::Object(obj),
+                import_platform,
+            )?])
         }
         _ => Err("Trae 导入 JSON 必须是对象或数组".to_string()),
     }
 }
 
-pub fn import_from_json(json_content: &str) -> Result<Vec<TraeAccount>, String> {
-    if let Ok(account) = serde_json::from_str::<TraeAccount>(json_content) {
+/// 对完整 TraeAccount 格式的导入项补齐平台标记：
+/// 仅在账号自身没有任何显式平台标记时，才采用导入入口的平台上下文，
+/// 避免把本应用导出的国际站 / CN 账号错误改判到另一平台。
+fn stamp_import_platform_on_account(account: &mut TraeAccount, platform: TraePlatformKind) {
+    let profile_root = profile_payload_root(account.trae_profile_raw.as_ref());
+    let roots = [
+        account.trae_auth_raw.as_ref(),
+        profile_root,
+        account.trae_server_raw.as_ref(),
+        account.trae_entitlement_raw.as_ref(),
+        account.trae_usage_raw.as_ref(),
+    ];
+    if detect_explicit_platform_from_roots(&roots).is_some() {
+        return;
+    }
+    let mut auth = match account.trae_auth_raw.take() {
+        Some(Value::Object(obj)) => obj,
+        _ => Map::new(),
+    };
+    auth.insert(
+        "platformId".to_string(),
+        Value::String(platform.provider_key().to_string()),
+    );
+    auth.insert(
+        "platformName".to_string(),
+        Value::String(platform.display_name().to_string()),
+    );
+    auth.insert(
+        "authDomain".to_string(),
+        Value::String(platform.auth_domain().to_string()),
+    );
+    account.trae_auth_raw = Some(Value::Object(auth));
+}
+
+pub fn import_from_json(
+    json_content: &str,
+    platform: Option<TraePlatformKind>,
+) -> Result<Vec<TraeAccount>, String> {
+    if let Ok(mut account) = serde_json::from_str::<TraeAccount>(json_content) {
+        if let Some(platform) = platform {
+            stamp_import_platform_on_account(&mut account, platform);
+        }
         let saved = upsert_account_record(account)?;
         return Ok(vec![saved]);
     }
 
     if let Ok(accounts) = serde_json::from_str::<Vec<TraeAccount>>(json_content) {
         let mut result = Vec::new();
-        for account in accounts {
+        for mut account in accounts {
+            if let Some(platform) = platform {
+                stamp_import_platform_on_account(&mut account, platform);
+            }
             let saved = upsert_account_record(account)?;
             result.push(saved);
         }
@@ -548,7 +682,7 @@ pub fn import_from_json(json_content: &str) -> Result<Vec<TraeAccount>, String> 
 
     let value = serde_json::from_str::<Value>(json_content)
         .map_err(|e| format!("解析 JSON 失败: {}", e))?;
-    let payloads = payloads_from_import_json_value(value)?;
+    let payloads = payloads_from_import_json_value(value, platform)?;
     let mut result = Vec::with_capacity(payloads.len());
     for payload in payloads {
         let saved = upsert_account(payload)?;

@@ -252,7 +252,11 @@ export function TraeAccountsPage({ platformId = 'trae' }: TraeAccountsPageProps)
   );
   const dataService = useMemo(
     () => ({
-      importFromJson: traeService.importTraeFromJson,
+      importFromJson: async (content: string) => {
+        const imported = await traeService.importTraeFromJson(content, platformId);
+        await loadTargetCurrentAccountId();
+        return imported;
+      },
       importFromLocal: async () => {
         const imported = await traeService.importTraeFromLocal(platformId);
         await loadTargetCurrentAccountId();

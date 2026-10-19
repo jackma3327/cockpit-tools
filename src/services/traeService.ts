@@ -52,8 +52,11 @@ export async function deleteTraeAccounts(accountIds: string[]): Promise<void> {
   return await invoke('delete_trae_accounts', { accountIds });
 }
 
-export async function importTraeFromJson(jsonContent: string): Promise<TraeAccount[]> {
-  return await invoke('import_trae_from_json', { jsonContent });
+export async function importTraeFromJson(
+  jsonContent: string,
+  platformId: TraePlatformId = 'trae',
+): Promise<TraeAccount[]> {
+  return await invoke('import_trae_from_json', { jsonContent, platformId });
 }
 
 export async function importTraeFromLocal(
