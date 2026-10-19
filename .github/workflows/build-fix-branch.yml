@@ -1,0 +1,97 @@
+name: Build macOS DMG (fix branch)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "fix/**"
+
+concurrency:
+  group: fix-branch-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos:
+    name: "macOS ${{ matrix.label }}"
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "aarch64"
+            args: "--target aarch64-apple-darwin"
+            release_dir: "target/aarch64-apple-darwin/release"
+          - label: "universal"
+            args: "--target universal-apple-darwin"
+            release_dir: "target/universal-apple-darwin/release"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust setup
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: fix-branch-macos-${{ matrix.label }}
+
+      - name: Go setup
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sidecars/cockpit-cliproxy/go.mod
+          cache-dependency-path: sidecars/cockpit-cliproxy/go.sum
+
+      - name: Node.js setup
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Sync versions
+        run: npm run sync-version
+
+      - name: Build app (unsigned)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx tauri build --ci --config src-tauri/tauri.ci.conf.json ${{ matrix.args }} 2>&1 | tee "build-${{ matrix.label }}.log"
+
+      - name: Print build logs on failure
+        if: failure()
+        run: |
+          echo "=== BUILD LOG ==="
+          if [ -f "build-${{ matrix.label }}.log" ]; then
+            tail -n 200 "build-${{ matrix.label }}.log"
+          else
+            echo "Log file not found"
+          fi
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-macos-${{ matrix.label }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            build-${{ matrix.label }}.log
+
+      - name: Upload bundles (dmg/app)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundles-macos-${{ matrix.label }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ matrix.release_dir }}/bundle
